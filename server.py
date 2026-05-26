@@ -13,15 +13,22 @@ Configuration (environment variables):
   PORT            Port this server listens on          (default: 8000)
 
 Endpoints:
-  GET /health                      Liveness check
-  GET /devices                     List devices, optional filters: location, tenant, role, name
-  GET /devices/<name>              Single device detail by exact hostname
-  GET /tenants                     List all tenants
-  GET /locations                   List all locations, optional filter: type
-  GET /summary                     Total counts of devices, tenants, locations
-  GET /metrics/device/<name>       Live Prometheus metrics for a device by hostname
+  GET  /health                      Liveness check
+  GET  /devices                     List devices, filters: location, tenant, role, name
+  GET  /devices/<name>              Single device detail by exact hostname
+  GET  /tenants                     List all tenants
+  GET  /locations                   List all locations, optional filter: type
+  GET  /summary                     Total counts of devices, tenants, locations
+  GET  /metrics/device/<name>       Live Prometheus metrics for a device by hostname
+  GET  /device-creation-context     All data needed to create a device (tenants, locations,
+                                    roles, device types, prefixes, namespaces, workflow guide)
+                                    Optional filter: ?tenant=<name>
+  POST /devices                     Create a device with full workflow (resolves names,
+                                    creates device type / prefix / IP if needed, assigns
+                                    management IP and sets primary_ip4)
 """
 
+import ipaddress
 import json
 import os
 import urllib.parse
@@ -59,6 +66,30 @@ def nb_get(endpoint, params=None):
     r = requests.get(f"{NAUTOBOT_URL}/api/{endpoint}", headers=NB_HEADERS, params=params, timeout=15)
     if r.status_code == 400:
         raise ValueError(f"Invalid filter: {r.json()}")
+    r.raise_for_status()
+    return r.json()
+
+
+def nb_post(endpoint, body):
+    """POST to a Nautobot REST API endpoint and return the created object."""
+    r = requests.post(
+        f"{NAUTOBOT_URL}/api/{endpoint}",
+        headers={**NB_HEADERS, "Content-Type": "application/json"},
+        json=body,
+        timeout=15,
+    )
+    r.raise_for_status()
+    return r.json()
+
+
+def nb_patch(endpoint, body):
+    """PATCH a Nautobot REST API endpoint and return the updated object."""
+    r = requests.patch(
+        f"{NAUTOBOT_URL}/api/{endpoint}",
+        headers={**NB_HEADERS, "Content-Type": "application/json"},
+        json=body,
+        timeout=15,
+    )
     r.raise_for_status()
     return r.json()
 
@@ -226,18 +257,284 @@ class Handler(BaseHTTPRequestHandler):
                 else:
                     self.respond({"device": device_name, "metrics": metrics})
 
+            elif path == "/device-creation-context":
+                tenant_q = qs.get("tenant")
+
+                # Global catalog: roles, manufacturers, device types, namespaces
+                roles_data = nb_get("extras/roles/", {"content_types": "dcim.device", "limit": 50})
+                roles = [{"id": r["id"], "name": r["name"]} for r in roles_data.get("results", [])]
+
+                mfr_data = nb_get("dcim/manufacturers/", {"limit": 50})
+                manufacturers = [{"id": m["id"], "name": m["name"]} for m in mfr_data.get("results", [])]
+                mfr_by_id = {m["id"]: m["name"] for m in mfr_data.get("results", [])}
+
+                # depth=1 to get manufacturer.name nested inside device types
+                dt_data = nb_get("dcim/device-types/", {"limit": 50, "depth": 1})
+                all_device_types = [
+                    {
+                        "id":           dt["id"],
+                        "model":        dt.get("model", ""),
+                        "manufacturer": (dt.get("manufacturer") or {}).get("name", ""),
+                    }
+                    for dt in dt_data.get("results", [])
+                ]
+
+                ns_data = nb_get("ipam/namespaces/", {"limit": 20})
+                namespaces = [{"id": n["id"], "name": n["name"]} for n in ns_data.get("results", [])]
+
+                # Tenants — filtered if ?tenant= was provided
+                t_params = {"limit": 50}
+                if tenant_q:
+                    t_params["q"] = tenant_q
+                tenants_data = nb_get("tenancy/tenants/", t_params)
+                tenants = [{"id": t["id"], "name": t["name"]} for t in tenants_data.get("results", [])]
+
+                # Per-tenant: locations (derived from device assignments) + prefixes + suggested types
+                locations_by_tenant = {}
+                prefixes_by_tenant = {}
+                suggested_device_types = {}
+
+                for t in tenants[:5]:
+                    tid = t["id"]
+                    tid_str = str(tid)
+
+                    # Locations aren't tenant-tagged directly — derive from the tenant's devices.
+                    # depth=1 expands location.name and device_type.model in one call.
+                    try:
+                        devs = nb_get("dcim/devices/", {"tenant_id": tid, "limit": 100, "depth": 1})
+                        seen_locs, seen_dts = {}, {}
+                        for d in devs.get("results", []):
+                            loc = d.get("location") or {}
+                            if loc.get("id") and loc["id"] not in seen_locs:
+                                seen_locs[loc["id"]] = {
+                                    "id":   loc["id"],
+                                    "name": loc.get("name") or loc.get("display", ""),
+                                }
+                            dt = d.get("device_type") or {}
+                            if dt.get("id") and dt["id"] not in seen_dts:
+                                mfr_id = (dt.get("manufacturer") or {}).get("id", "")
+                                seen_dts[dt["id"]] = {
+                                    "id":           dt["id"],
+                                    "model":        dt.get("model", ""),
+                                    "manufacturer": mfr_by_id.get(mfr_id, ""),
+                                }
+                        locations_by_tenant[tid_str]      = list(seen_locs.values())
+                        suggested_device_types[tid_str]   = list(seen_dts.values())
+                    except Exception:
+                        locations_by_tenant[tid_str]    = []
+                        suggested_device_types[tid_str] = []
+
+                    try:
+                        pfxs = nb_get("ipam/prefixes/", {"tenant_id": tid, "limit": 30})
+                        prefixes_by_tenant[tid_str] = [
+                            {
+                                "id":        p["id"],
+                                "prefix":    p["prefix"],
+                                "status":    (p.get("status")    or {}).get("value", ""),
+                                "namespace": (p.get("namespace") or {}).get("name", "Global"),
+                            }
+                            for p in pfxs.get("results", [])
+                        ]
+                    except Exception:
+                        prefixes_by_tenant[tid_str] = []
+
+                self.respond({
+                    "tenants":                          tenants,
+                    "device_roles":                     roles,
+                    "manufacturers":                    manufacturers,
+                    "all_device_types":                 all_device_types,
+                    "ipam_namespaces":                  namespaces,
+                    "locations_by_tenant":              locations_by_tenant,
+                    "prefixes_by_tenant":               prefixes_by_tenant,
+                    "suggested_device_types_by_tenant": suggested_device_types,
+                    "workflow_guide": {
+                        "description": "POST /devices handles the full creation workflow",
+                        "post_body": {
+                            "name":         "string — device hostname (required)",
+                            "tenant":       "string — tenant name (required)",
+                            "location":     "string — location name, partial match OK (required)",
+                            "role":         "string — role name e.g. 'Access Switch' (required)",
+                            "device_type":  "string — model name e.g. 'Catalyst 9300' (required)",
+                            "manufacturer": "string — required only if device_type doesn't exist yet",
+                            "status":       "string — 'Active'|'Planned'|'Staged' (default: 'Active')",
+                            "management_ip": "string — CIDR e.g. '10.1.1.1/24' (optional)",
+                        },
+                        "notes": [
+                            "Names are resolved to IDs automatically — no UUIDs needed",
+                            "If device_type is unknown, provide manufacturer to create it",
+                            "If management_ip prefix doesn't exist it will be created",
+                            "management_ip is assigned to a 'mgmt0' interface and set as primary_ip4",
+                        ],
+                    },
+                })
+
             else:
                 self.respond({
                     "error":     "Not found",
                     "endpoints": [
-                        "/health",
-                        "/devices",
-                        "/devices/<name>",
-                        "/tenants",
-                        "/locations",
-                        "/summary",
-                        "/metrics/device/<name>",
+                        "GET  /health",
+                        "GET  /devices",
+                        "GET  /devices/<name>",
+                        "GET  /tenants",
+                        "GET  /locations",
+                        "GET  /summary",
+                        "GET  /metrics/device/<name>",
+                        "GET  /device-creation-context",
+                        "POST /devices",
                     ],
+                }, 404)
+
+        except Exception as e:
+            self.respond({"error": str(e)}, 500)
+
+    def do_POST(self):
+        parsed = urllib.parse.urlparse(self.path)
+        path   = parsed.path.rstrip("/")
+
+        try:
+            length = int(self.headers.get("Content-Length", 0))
+            body   = json.loads(self.rfile.read(length)) if length else {}
+        except Exception:
+            self.respond({"error": "Invalid JSON body"}, 400)
+            return
+
+        try:
+            if path == "/devices":
+                name            = body.get("name")
+                tenant_name     = body.get("tenant")
+                location_name   = body.get("location")
+                role_name       = body.get("role")
+                dt_model        = body.get("device_type")
+                manufacturer    = body.get("manufacturer")
+                status          = body.get("status", "Active")
+                management_ip   = body.get("management_ip")
+
+                if not all([name, tenant_name, location_name, role_name, dt_model]):
+                    self.respond({"error": "Required fields: name, tenant, location, role, device_type"}, 400)
+                    return
+
+                # Resolve tenant (exact name match)
+                t_data = nb_get("tenancy/tenants/", {"name": tenant_name})
+                if not t_data["results"]:
+                    self.respond({"error": f"Tenant '{tenant_name}' not found"}, 404)
+                    return
+                tenant_id = t_data["results"][0]["id"]
+
+                # Resolve location via fuzzy q= search (same approach as /devices GET)
+                loc_data = nb_get("dcim/locations/", {"q": location_name, "limit": 5})
+                if not loc_data["results"]:
+                    self.respond({"error": f"Location '{location_name}' not found"}, 404)
+                    return
+                location_id      = loc_data["results"][0]["id"]
+                location_display = loc_data["results"][0].get("display", location_name)
+
+                # Resolve role
+                role_data = nb_get("extras/roles/", {"name": role_name, "content_types": "dcim.device"})
+                if not role_data["results"]:
+                    # Fall back to q= fuzzy search
+                    role_data = nb_get("extras/roles/", {"q": role_name, "content_types": "dcim.device"})
+                if not role_data["results"]:
+                    self.respond({"error": f"Role '{role_name}' not found"}, 404)
+                    return
+                role_id = role_data["results"][0]["id"]
+
+                # Resolve device type — create if not found (requires manufacturer)
+                dt_data = nb_get("dcim/device-types/", {"model": dt_model})
+                if dt_data["results"]:
+                    device_type_id = dt_data["results"][0]["id"]
+                else:
+                    if not manufacturer:
+                        self.respond({
+                            "error": f"Device type '{dt_model}' not found. "
+                                     "Provide 'manufacturer' in the request body to create it."
+                        }, 404)
+                        return
+                    mfr_data = nb_get("dcim/manufacturers/", {"name": manufacturer})
+                    if mfr_data["results"]:
+                        mfr_id = mfr_data["results"][0]["id"]
+                    else:
+                        mfr    = nb_post("dcim/manufacturers/", {"name": manufacturer})
+                        mfr_id = mfr["id"]
+                    dt             = nb_post("dcim/device-types/", {"model": dt_model, "manufacturer": mfr_id})
+                    device_type_id = dt["id"]
+
+                # Create the device
+                device    = nb_post("dcim/devices/", {
+                    "name":        name,
+                    "device_type": device_type_id,
+                    "role":        role_id,
+                    "location":    location_id,
+                    "tenant":      tenant_id,
+                    "status":      status,
+                })
+                device_id = device["id"]
+
+                result = {
+                    "device": {
+                        "id":          device_id,
+                        "name":        name,
+                        "status":      status,
+                        "tenant":      tenant_name,
+                        "location":    location_display,
+                        "role":        role_name,
+                        "device_type": dt_model,
+                    }
+                }
+
+                # Optional: create management IP, assign to mgmt0, set as primary_ip4
+                if management_ip:
+                    # Get the Global namespace id
+                    ns_data      = nb_get("ipam/namespaces/", {"name": "Global"})
+                    namespace_id = ns_data["results"][0]["id"] if ns_data["results"] else None
+
+                    # Ensure a covering prefix exists — create one if not
+                    net        = ipaddress.ip_interface(management_ip).network
+                    prefix_str = str(net)
+                    pfx_data   = nb_get("ipam/prefixes/", {"prefix": prefix_str})
+                    if not pfx_data["results"]:
+                        pfx_body = {"prefix": prefix_str, "status": "Active", "tenant": tenant_id}
+                        if namespace_id:
+                            pfx_body["namespace"] = namespace_id
+                        nb_post("ipam/prefixes/", pfx_body)
+
+                    # Create the IP address
+                    ip_body = {"address": management_ip, "status": "Active", "tenant": tenant_id}
+                    if namespace_id:
+                        ip_body["namespace"] = namespace_id
+                    ip    = nb_post("ipam/ip-addresses/", ip_body)
+                    ip_id = ip["id"]
+
+                    # Create a mgmt0 interface on the device
+                    iface    = nb_post("dcim/interfaces/", {
+                        "device": device_id,
+                        "name":   "mgmt0",
+                        "type":   "virtual",
+                        "status": "Active",
+                    })
+                    iface_id = iface["id"]
+
+                    # Assign the IP to the interface via Nautobot 2.x dedicated endpoint
+                    nb_post("ipam/ip-address-to-interface/", {
+                        "ip_address": ip_id,
+                        "interface":  iface_id,
+                    })
+
+                    # Set as device primary IPv4
+                    nb_patch(f"dcim/devices/{device_id}/", {"primary_ip4": ip_id})
+
+                    result["management_ip"] = {
+                        "id":        ip_id,
+                        "address":   management_ip,
+                        "interface": "mgmt0",
+                        "prefix":    prefix_str,
+                    }
+
+                self.respond(result, 201)
+
+            else:
+                self.respond({
+                    "error":     "Not found",
+                    "endpoints": ["POST /devices"],
                 }, 404)
 
         except Exception as e:
