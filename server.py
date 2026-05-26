@@ -94,32 +94,49 @@ class Handler(BaseHTTPRequestHandler):
                 self.respond({"status": "ok"})
 
             elif path == "/devices":
-                # Build Nautobot filter params from query string.
+                # Require at least one filter — scanning all devices is too expensive
+                # at scale (50k+ devices). The caller must narrow by location, tenant,
+                # role, or name before we touch the devices table.
+                if not any(qs.get(k) for k in ("location", "tenant", "role", "name")):
+                    self.respond({
+                        "error": "At least one filter is required (location, tenant, role, or name). "
+                                 "Call /tenants first to find a tenant, then /locations?tenant=<name> "
+                                 "to find a location, then /devices?tenant=<name>&location=<name>."
+                    }, 400)
+                    return
+
+                limit  = int(qs.get("limit", 50))
+                offset = int(qs.get("offset", 0))
+
                 # depth=1 tells Nautobot to expand nested objects (status, role, etc.)
                 # so fmt_device() can read their names without extra API calls.
-                params = {"limit": int(qs.get("limit", 100)), "depth": 1}
+                params = {"limit": limit, "offset": offset, "depth": 1}
                 for k in ("tenant", "role", "name"):
                     if qs.get(k):
                         params[k] = qs[k]
 
                 if qs.get("location"):
-                    # Nautobot's location filter requires an exact name match, which
-                    # breaks when partial names are passed (e.g. "Auckland CBD" instead
-                    # of "ANZ Bank New Zealand Auckland CBD"). We use the q= fuzzy search
-                    # on /dcim/locations/ first to resolve any matching location IDs,
-                    # then filter devices by those IDs instead.
+                    # Resolve partial location name → IDs via q= fuzzy search.
+                    # Locations don't carry a tenant field, so we can't narrow here —
+                    # the tenant filter on the devices query below handles that instead.
+                    # Passing all matching location IDs + tenant to Nautobot's devices
+                    # API is still an efficient indexed lookup.
                     loc_data = nb_get("dcim/locations/", {"q": qs["location"], "limit": 50})
                     loc_ids  = [loc["id"] for loc in loc_data.get("results", [])]
                     if loc_ids:
-                        params["location"] = loc_ids  # requests serialises lists as repeated params
+                        params["location"] = loc_ids
                     else:
                         self.respond({"count": 0, "devices": [], "note": f"No locations matched '{qs['location']}'"})
                         return
 
-                data = nb_get("dcim/devices/", params)
+                data     = nb_get("dcim/devices/", params)
+                returned = len(data["results"])
                 self.respond({
-                    "count":   data["count"],
-                    "devices": [fmt_device(d) for d in data["results"]],
+                    "count":    data["count"],   # total matching in Nautobot
+                    "returned": returned,         # devices in this page
+                    "offset":   offset,
+                    "has_more": (offset + returned) < data["count"],
+                    "devices":  [fmt_device(d) for d in data["results"]],
                 })
 
             elif path.startswith("/devices/"):
