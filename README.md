@@ -20,8 +20,10 @@ The server has no database of its own — every request proxies live data from N
 | File | Description |
 |------|-------------|
 | `server.py` | The tool server — run this |
-| `nautobot_ow_tool.py` | Open WebUI Python function tool (8 methods) |
+| `nautobot_ow_tool.py` | Open WebUI Python function tool — proxies through `server.py` |
+| `nautobot_ow_tool_serverless.py` | Open WebUI Python function tool — talks directly to Nautobot, no server needed |
 | `register_ow_tool.py` | One-shot script to register the tool into Open WebUI |
+| `docker-compose.yml` | Runs the tool server as a container |
 
 ## Endpoints
 
@@ -219,7 +221,16 @@ openwebui-setup:
 
 ### Manual
 
-Go to **Open WebUI → Admin Panel → Tools → + Add Tool** and paste in the contents of `nautobot_ow_tool.py`.
+There are two tool files — choose one:
+
+| File | When to use |
+|------|-------------|
+| `nautobot_ow_tool.py` | You're running `server.py` (or the Docker Compose service) |
+| `nautobot_ow_tool_serverless.py` | You want Open WebUI to talk directly to Nautobot — no tool server needed |
+
+Go to **Open WebUI → Workspace → Tools → + Add Tool** and paste in the contents of your chosen file.
+
+For the serverless variant, set the **Valves** (`NAUTOBOT_URL`, `NAUTOBOT_TOKEN`, `PROMETHEUS_URL`) after adding the tool — these appear as editable fields in the tool's settings page.
 
 ## Open WebUI tool methods
 
