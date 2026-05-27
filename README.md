@@ -155,24 +155,27 @@ All configuration is via environment variables:
 
 ### Docker Compose (recommended)
 
-The server uses the Nautobot base image (which already has `requests`) and mounts `server.py` as a bind mount so changes apply with a simple container restart — no rebuild needed.
+A `docker-compose.yml` is included. Set your environment variables and start:
 
-```yaml
-nautobot-tool-server:
-  image: networktocode/nautobot:2.3-py3.11
-  entrypoint: ["python"]
-  command: ["/app/server.py"]
-  volumes:
-    - ./server.py:/app/server.py:ro
-  environment:
-    NAUTOBOT_URL: http://nautobot:8080
-    NAUTOBOT_TOKEN: your-token-here
-    PROMETHEUS_URL: http://prometheus:9090
-    PORT: "8000"
-  depends_on:
-    nautobot:
-      condition: service_healthy
+```bash
+NAUTOBOT_URL=http://your-nautobot:8080 \
+NAUTOBOT_TOKEN=your-token-here \
+PROMETHEUS_URL=http://your-prometheus:9090 \
+docker-compose up -d
 ```
+
+Or create a `.env` file:
+
+```env
+NAUTOBOT_URL=http://your-nautobot:8080
+NAUTOBOT_TOKEN=your-token-here
+PROMETHEUS_URL=http://your-prometheus:9090
+PORT=8000
+```
+
+Then just `docker-compose up -d`. The server listens on port 8000 by default.
+
+`server.py` is bind-mounted read-only — changes take effect with `docker-compose restart`, no rebuild needed.
 
 ### Local development
 
