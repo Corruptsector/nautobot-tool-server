@@ -6,7 +6,6 @@ description: Query and manage the Nautobot network inventory. Talks directly to 
 
 import ipaddress
 import json
-import re
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -83,6 +82,7 @@ class Tools:
             return json.loads(resp.read())
 
     def _device_selector(self, name):
+        import re
         lbl     = self.valves.PROMETHEUS_DEVICE_LABEL
         escaped = re.sub(r'([.+*?^${}()|[\]\\])', r'\\\1', name)
         return f'{lbl}=~"(?i){escaped}"'
