@@ -108,35 +108,6 @@ class Tools:
             "monitoring":  (d.get("custom_fields") or {}).get("monitoring"),
         }
 
-    def _fetch_metrics(self, name):
-        sel     = self._device_selector(name)
-        metrics = {}
-        scalar_queries = {
-            "cpu_percent":    f'device_cpu_percent{{{sel}}}',
-            "memory_percent": f'device_memory_percent{{{sel}}}',
-            "up":             f'device_up{{{sel}}}',
-            "uptime_seconds": f'device_uptime_seconds{{{sel}}}',
-            "bgp_peers":      f'device_bgp_peers{{{sel}}}',
-        }
-        for key, q in scalar_queries.items():
-            res    = self._prom_query(q)
-            result = res.get("data", {}).get("result", [])
-            if result:
-                metrics[key] = float(result[0]["value"][1])
-                if key == "up":
-                    lbl = result[0].get("metric", {})
-                    metrics["tenant"]   = lbl.get("tenant", "")
-                    metrics["location"] = lbl.get("location", "")
-                    metrics["role"]     = lbl.get("role", "")
-        for direction in ("rx", "tx"):
-            res    = self._prom_query(f'device_interface_{direction}_bps{{{sel}}}')
-            ifaces = {}
-            for r in res.get("data", {}).get("result", []):
-                ifaces[r["metric"].get("interface", "?")] = round(float(r["value"][1]) / 1e6, 2)
-            if ifaces:
-                metrics[f"interfaces_{direction}_mbps"] = ifaces
-        return metrics
-
     # ── Tool methods ──────────────────────────────────────────────────────────
 
     def list_tenants(self, limit: int = 50, offset: int = 0) -> str:
@@ -336,16 +307,11 @@ class Tools:
     def get_device_metrics(self, name: str) -> str:
         """
         Get live Prometheus metrics for a specific device by its exact hostname.
-        For devices running the built-in exporter, returns CPU, memory, uptime, BGP peers,
-        and interface throughput in Mbps. For SNMP-exported devices (where those metrics
-        don't exist), automatically falls back to discovering all available metric series
-        — equivalent to calling get_available_metrics(). Uses PROMETHEUS_DEVICE_LABEL valve
-        to match the device (default: 'device'; set to 'instance' for SNMP exporter).
+        Always discovers what metrics are available rather than assuming fixed names —
+        works with any exporter (SNMP, built-in, etc.). Uses PROMETHEUS_DEVICE_LABEL
+        valve to match the device (default: 'device'; set to 'instance' or
+        'exported_instance' for SNMP exporter).
         """
-        metrics = self._fetch_metrics(name)
-        if metrics:
-            return json.dumps({"device": name, "metrics": metrics}, indent=2)
-        # No built-in metrics — fall back to full metric discovery (SNMP exporter etc.)
         return self.get_available_metrics(name)
 
     def get_available_metrics(self, name: str) -> str:
@@ -455,11 +421,8 @@ class Tools:
                 "devices": [self._fmt_device(d) for d in devs["results"]],
             }, indent=2)
 
-        name    = devs["results"][0]["name"]
-        metrics = self._fetch_metrics(name)
-        if not metrics:
-            return json.dumps({"error": f"No metrics found for device '{name}'"}, indent=2)
-        return json.dumps({"device": name, "metrics": metrics}, indent=2)
+        name = devs["results"][0]["name"]
+        return self.get_available_metrics(name)
 
     def get_device_creation_context(self, tenant: str = "") -> str:
         """
