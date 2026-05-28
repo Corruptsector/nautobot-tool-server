@@ -17,6 +17,7 @@ class Tools:
         NAUTOBOT_URL: str = "http://nautobot:8080"
         NAUTOBOT_TOKEN: str = ""
         PROMETHEUS_URL: str = "http://prometheus:9090"
+        PROMETHEUS_DEVICE_LABEL: str = "device"
 
     def __init__(self):
         self.valves = self.Valves()
@@ -78,6 +79,10 @@ class Tools:
         with urllib.request.urlopen(url, timeout=10) as resp:
             return json.loads(resp.read())
 
+    def _device_selector(self, name):
+        lbl = self.valves.PROMETHEUS_DEVICE_LABEL
+        return f'{lbl}="{name}"'
+
     def _fmt_device(self, d):
         return {
             "name":        d["name"],
@@ -91,13 +96,14 @@ class Tools:
         }
 
     def _fetch_metrics(self, name):
+        sel     = self._device_selector(name)
         metrics = {}
         scalar_queries = {
-            "cpu_percent":    f'device_cpu_percent{{device="{name}"}}',
-            "memory_percent": f'device_memory_percent{{device="{name}"}}',
-            "up":             f'device_up{{device="{name}"}}',
-            "uptime_seconds": f'device_uptime_seconds{{device="{name}"}}',
-            "bgp_peers":      f'device_bgp_peers{{device="{name}"}}',
+            "cpu_percent":    f'device_cpu_percent{{{sel}}}',
+            "memory_percent": f'device_memory_percent{{{sel}}}',
+            "up":             f'device_up{{{sel}}}',
+            "uptime_seconds": f'device_uptime_seconds{{{sel}}}',
+            "bgp_peers":      f'device_bgp_peers{{{sel}}}',
         }
         for key, q in scalar_queries.items():
             res    = self._prom_query(q)
@@ -110,7 +116,7 @@ class Tools:
                     metrics["location"] = lbl.get("location", "")
                     metrics["role"]     = lbl.get("role", "")
         for direction in ("rx", "tx"):
-            res    = self._prom_query(f'device_interface_{direction}_bps{{device="{name}"}}')
+            res    = self._prom_query(f'device_interface_{direction}_bps{{{sel}}}')
             ifaces = {}
             for r in res.get("data", {}).get("result", []):
                 ifaces[r["metric"].get("interface", "?")] = round(float(r["value"][1]) / 1e6, 2)
@@ -324,6 +330,55 @@ class Tools:
         if not metrics:
             return json.dumps({"error": f"No metrics found for device '{name}'"}, indent=2)
         return json.dumps({"device": name, "metrics": metrics}, indent=2)
+
+    def get_available_metrics(self, name: str) -> str:
+        """
+        Discover all Prometheus metric series available for a device by its hostname.
+        Returns every metric name and its current value — useful when the Prometheus
+        exporter is unknown (e.g. SNMP exporter) and you need to know what data exists
+        before querying specific metrics. Uses the PROMETHEUS_DEVICE_LABEL valve to find
+        the device (default: 'device'; set to 'instance' or 'exported_instance' for SNMP).
+        """
+        sel = self._device_selector(name)
+        url = (
+            f"{self.valves.PROMETHEUS_URL}/api/v1/series?"
+            + urllib.parse.urlencode({"match[]": f"{{{sel}}}"})
+        )
+        try:
+            with urllib.request.urlopen(url, timeout=10) as resp:
+                series_data = json.loads(resp.read())
+        except Exception as e:
+            return json.dumps({"error": str(e)}, indent=2)
+
+        series = series_data.get("data", [])
+        if not series:
+            return json.dumps({
+                "error": f"No metrics found for device '{name}' using label "
+                         f"'{self.valves.PROMETHEUS_DEVICE_LABEL}={name}'",
+                "hint": "Check PROMETHEUS_DEVICE_LABEL valve — try 'instance' or 'exported_instance' for SNMP exporter",
+            }, indent=2)
+
+        metric_names = sorted({s["__name__"] for s in series})
+
+        sample_values = {}
+        for metric in metric_names[:20]:
+            res = self._prom_query(f'{metric}{{{sel}}}')
+            results = res.get("data", {}).get("result", [])
+            if results:
+                labels = {k: v for k, v in results[0]["metric"].items() if not k.startswith("__")}
+                labels.pop(self.valves.PROMETHEUS_DEVICE_LABEL, None)
+                sample_values[metric] = {
+                    "value":  results[0]["value"][1],
+                    "labels": labels,
+                    "series_count": len(results),
+                }
+
+        return json.dumps({
+            "device": name,
+            "label_used": f"{self.valves.PROMETHEUS_DEVICE_LABEL}={name}",
+            "total_metrics": len(metric_names),
+            "metrics": sample_values,
+        }, indent=2)
 
     def get_metrics_by_location(self, location: str, role: str = "", tenant: str = "") -> str:
         """
