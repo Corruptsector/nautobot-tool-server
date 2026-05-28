@@ -18,6 +18,8 @@ class Tools:
         NAUTOBOT_TOKEN: str = ""
         PROMETHEUS_URL: str = "http://prometheus:9090"
         PROMETHEUS_DEVICE_LABEL: str = "device"
+        GRAFANA_URL: str = ""
+        GRAFANA_DATASOURCE: str = "prometheus"
 
     def __init__(self):
         self.valves = self.Valves()
@@ -82,6 +84,16 @@ class Tools:
     def _device_selector(self, name):
         lbl = self.valves.PROMETHEUS_DEVICE_LABEL
         return f'{lbl}="{name}"'
+
+    def _grafana_explore_url(self, expr):
+        if not self.valves.GRAFANA_URL:
+            return None
+        left = json.dumps({
+            "datasource": self.valves.GRAFANA_DATASOURCE,
+            "queries": [{"expr": expr, "refId": "A"}],
+            "range": {"from": "now-1h", "to": "now"},
+        }, separators=(",", ":"))
+        return f"{self.valves.GRAFANA_URL.rstrip('/')}/explore?orgId=1&left={urllib.parse.quote(left)}"
 
     def _fmt_device(self, d):
         return {
@@ -334,10 +346,11 @@ class Tools:
     def get_available_metrics(self, name: str) -> str:
         """
         Discover all Prometheus metric series available for a device by its hostname.
-        Returns every metric name and its current value — useful when the Prometheus
-        exporter is unknown (e.g. SNMP exporter) and you need to know what data exists
-        before querying specific metrics. Uses the PROMETHEUS_DEVICE_LABEL valve to find
-        the device (default: 'device'; set to 'instance' or 'exported_instance' for SNMP).
+        Returns every metric name, its current value, and a Grafana Explore link (if
+        GRAFANA_URL is configured). Useful when the Prometheus exporter is unknown
+        (e.g. SNMP exporter) and you need to know what data exists before querying.
+        Uses PROMETHEUS_DEVICE_LABEL valve to find the device (default: 'device';
+        set to 'instance' or 'exported_instance' for SNMP exporter).
         """
         sel = self._device_selector(name)
         url = (
@@ -362,22 +375,50 @@ class Tools:
 
         sample_values = {}
         for metric in metric_names[:20]:
-            res = self._prom_query(f'{metric}{{{sel}}}')
+            expr    = f'{metric}{{{sel}}}'
+            res     = self._prom_query(expr)
             results = res.get("data", {}).get("result", [])
             if results:
                 labels = {k: v for k, v in results[0]["metric"].items() if not k.startswith("__")}
                 labels.pop(self.valves.PROMETHEUS_DEVICE_LABEL, None)
-                sample_values[metric] = {
-                    "value":  results[0]["value"][1],
-                    "labels": labels,
+                entry = {
+                    "value":        results[0]["value"][1],
+                    "labels":       labels,
                     "series_count": len(results),
                 }
+                grafana_url = self._grafana_explore_url(expr)
+                if grafana_url:
+                    entry["grafana_url"] = grafana_url
+                sample_values[metric] = entry
 
-        return json.dumps({
-            "device": name,
-            "label_used": f"{self.valves.PROMETHEUS_DEVICE_LABEL}={name}",
+        result = {
+            "device":        name,
+            "label_used":    f"{self.valves.PROMETHEUS_DEVICE_LABEL}={name}",
             "total_metrics": len(metric_names),
-            "metrics": sample_values,
+            "metrics":       sample_values,
+        }
+        if self.valves.GRAFANA_URL:
+            result["grafana_all"] = self._grafana_explore_url(f'{{{sel}}}')
+
+        return json.dumps(result, indent=2)
+
+    def get_metric_grafana_link(self, device: str, metric: str) -> str:
+        """
+        Generate a Grafana Explore link for a specific metric and device.
+        Use this after get_available_metrics() when the user wants to view a
+        particular metric in Grafana. Requires GRAFANA_URL to be configured.
+        metric: exact metric name (e.g. 'ifHCInOctets', 'device_cpu_percent')
+        device: device hostname as it appears in Prometheus
+        """
+        if not self.valves.GRAFANA_URL:
+            return json.dumps({"error": "GRAFANA_URL valve is not configured"}, indent=2)
+        sel  = self._device_selector(device)
+        expr = f'{metric}{{{sel}}}'
+        return json.dumps({
+            "device":      device,
+            "metric":      metric,
+            "expr":        expr,
+            "grafana_url": self._grafana_explore_url(expr),
         }, indent=2)
 
     def get_metrics_by_location(self, location: str, role: str = "", tenant: str = "") -> str:
