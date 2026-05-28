@@ -59,7 +59,7 @@ Click the **+** button in the chat input area and toggle the Nautobot tool on. T
 | `list_tenants(limit, offset)` | List all tenants — paginated |
 | `list_locations(type, tenant)` | List locations. Filter by type (Site/Region/Country) or tenant |
 | `list_devices(tenant, location, role, limit, offset)` | List devices — paginated, at least one filter required |
-| `get_device(name)` | Full detail on a single device by hostname |
+| `get_device(name)` | Full detail on a single device by hostname — includes `monitoring` custom field |
 | `get_device_interfaces(name)` | List all interfaces on a device with assigned IPs |
 | `get_inventory_summary()` | Total counts of devices, tenants, locations |
 | `get_tenant_summary(tenant)` | Device breakdown for a tenant by role, device type, and location |
@@ -69,7 +69,7 @@ Click the **+** button in the chat input area and toggle the Nautobot tool on. T
 | `get_available_metrics(name)` | Discover all metric series for a device — includes Grafana Explore links if `GRAFANA_URL` is set |
 | `get_metric_grafana_link(device, metric)` | Generate a Grafana Explore link for a specific metric and device |
 | `get_device_creation_context(tenant)` | All context needed before creating a device |
-| `create_device(name, tenant, location, role, device_type, ...)` | Full device creation workflow |
+| `create_device(name, tenant, location, role, device_type, ...)` | Full device creation workflow — sets `monitoring` custom field (default: `if_mib`) |
 
 ## Example questions
 
@@ -91,9 +91,12 @@ name, tenant, location, role, device_type
   → creates device type + manufacturer if missing
   → creates IPAM prefix if missing
   → creates management IP, assigns to mgmt0, sets as primary_ip4
+  → sets monitoring custom field (default: if_mib)
 ```
 
 Call `get_device_creation_context(tenant=...)` first to discover valid names.
+
+Optional parameters: `manufacturer`, `status` (default: `Active`), `management_ip` (CIDR), `monitoring` (default: `if_mib`).
 
 ## Nautobot version notes
 
