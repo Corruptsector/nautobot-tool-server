@@ -23,11 +23,13 @@ The tool runs inside Open WebUI and calls Nautobot and Prometheus directly. Conf
 
 ### From GitHub (easiest)
 
-In Open WebUI go to **Workspace → Tools → + Add Tool → Load from URL** and paste:
+In Open WebUI go to **Workspace → Tools → + Add Tool → Load from URL** and paste the raw file URL:
 
 ```
 https://raw.githubusercontent.com/Corruptsector/nautobot-tool-server/master/nautobot_ow_tool_serverless.py
 ```
+
+> Raw file: https://raw.githubusercontent.com/Corruptsector/nautobot-tool-server/master/nautobot_ow_tool_serverless.py
 
 ### Manual
 
