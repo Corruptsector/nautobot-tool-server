@@ -6,6 +6,7 @@ description: Query and manage the Nautobot network inventory. Talks directly to 
 
 import ipaddress
 import json
+import re
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -82,8 +83,9 @@ class Tools:
             return json.loads(resp.read())
 
     def _device_selector(self, name):
-        lbl = self.valves.PROMETHEUS_DEVICE_LABEL
-        return f'{lbl}="{name}"'
+        lbl     = self.valves.PROMETHEUS_DEVICE_LABEL
+        escaped = re.sub(r'([.+*?^${}()|[\]\\])', r'\\\1', name)
+        return f'{lbl}=~"(?i){escaped}"'
 
     def _grafana_explore_url(self, expr):
         if not self.valves.GRAFANA_URL:
@@ -318,10 +320,10 @@ class Tools:
         """
         Discover all Prometheus metric series available for a device by its hostname.
         Returns every metric name, its current value, and a Grafana Explore link (if
-        GRAFANA_URL is configured). Useful when the Prometheus exporter is unknown
-        (e.g. SNMP exporter) and you need to know what data exists before querying.
-        Uses PROMETHEUS_DEVICE_LABEL valve to find the device (default: 'device';
-        set to 'instance' or 'exported_instance' for SNMP exporter).
+        GRAFANA_URL is configured). Matching is case-insensitive so Nautobot hostnames
+        like 'BNZ-BR0528-RT-01' match Prometheus labels like 'bnz-br0528-rt-01'.
+        Uses PROMETHEUS_DEVICE_LABEL valve (default: 'device'; set to 'instance' or
+        'exported_instance' for SNMP exporter).
         """
         sel = self._device_selector(name)
         url = (
@@ -330,15 +332,14 @@ class Tools:
         )
         try:
             with urllib.request.urlopen(url, timeout=10) as resp:
-                series_data = json.loads(resp.read())
+                series = json.loads(resp.read()).get("data", [])
         except Exception as e:
             return json.dumps({"error": str(e)}, indent=2)
 
-        series = series_data.get("data", [])
         if not series:
             return json.dumps({
                 "error": f"No metrics found for device '{name}' using label "
-                         f"'{self.valves.PROMETHEUS_DEVICE_LABEL}={name}'",
+                         f"'{self.valves.PROMETHEUS_DEVICE_LABEL}=~(?i){name}'",
                 "hint": "Check PROMETHEUS_DEVICE_LABEL valve — try 'instance' or 'exported_instance' for SNMP exporter",
             }, indent=2)
 
@@ -364,7 +365,7 @@ class Tools:
 
         result = {
             "device":        name,
-            "label_used":    f"{self.valves.PROMETHEUS_DEVICE_LABEL}={name}",
+            "label_used":    f"{self.valves.PROMETHEUS_DEVICE_LABEL}=~(?i){name}",
             "total_metrics": len(metric_names),
             "metrics":       sample_values,
         }
