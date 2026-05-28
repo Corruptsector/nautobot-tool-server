@@ -39,11 +39,14 @@ Go to **Workspace → Tools → + Add Tool** and paste in the contents of `nauto
 
 After adding the tool, click the gear icon and set:
 
-| Valve | Description |
-|-------|-------------|
-| `NAUTOBOT_URL` | Base URL of your Nautobot instance (e.g. `http://nautobot:8080`) |
-| `NAUTOBOT_TOKEN` | Nautobot API token |
-| `PROMETHEUS_URL` | Base URL of Prometheus (e.g. `http://prometheus:9090`) |
+| Valve | Default | Description |
+|-------|---------|-------------|
+| `NAUTOBOT_URL` | `http://nautobot:8080` | Base URL of your Nautobot instance |
+| `NAUTOBOT_TOKEN` | *(empty)* | Nautobot API token |
+| `PROMETHEUS_URL` | `http://prometheus:9090` | Base URL of Prometheus |
+| `PROMETHEUS_DEVICE_LABEL` | `device` | Label used to identify devices in Prometheus. Set to `instance` or `exported_instance` for SNMP exporter |
+| `GRAFANA_URL` | *(empty)* | Base URL of Grafana (e.g. `http://grafana:3000`). When set, metric responses include clickable Explore links |
+| `GRAFANA_DATASOURCE` | `prometheus` | Grafana datasource name as it appears in Grafana → Data Sources |
 
 ### Enable in chat
 
@@ -63,6 +66,8 @@ Click the **+** button in the chat input area and toggle the Nautobot tool on. T
 | `list_prefixes(tenant, limit, offset)` | List IPAM prefixes, optionally filtered by tenant |
 | `get_device_metrics(name)` | Live Prometheus metrics for a device by hostname |
 | `get_metrics_by_location(location, role, tenant)` | Metrics for a device at a location — resolves hostname automatically |
+| `get_available_metrics(name)` | Discover all metric series for a device — includes Grafana Explore links if `GRAFANA_URL` is set |
+| `get_metric_grafana_link(device, metric)` | Generate a Grafana Explore link for a specific metric and device |
 | `get_device_creation_context(tenant)` | All context needed before creating a device |
 | `create_device(name, tenant, location, role, device_type, ...)` | Full device creation workflow |
 
@@ -72,6 +77,8 @@ Click the **+** button in the chat input area and toggle the Nautobot tool on. T
 - *"List all devices for ANZ at Auckland CBD"* → `list_devices`
 - *"What are the metrics for the router at Kiwibank Wellington?"* → `get_metrics_by_location`
 - *"What interfaces does anz-akl-cbd-rtr-01 have?"* → `get_device_interfaces`
+- *"What metrics are available for anz-akl-cbd-rtr-01?"* → `get_available_metrics` (returns metric list + Grafana links)
+- *"Give me a Grafana link for CPU on anz-akl-cbd-rtr-01"* → `get_metric_grafana_link`
 - *"Create an access switch for Kiwibank in Wellington"* → `get_device_creation_context` then `create_device`
 
 ## Device creation
