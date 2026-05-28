@@ -336,13 +336,17 @@ class Tools:
     def get_device_metrics(self, name: str) -> str:
         """
         Get live Prometheus metrics for a specific device by its exact hostname.
-        Returns CPU percent, memory percent, up/down status, uptime, BGP peer count
-        (routers only), and per-interface receive/transmit throughput in Mbps.
+        For devices running the built-in exporter, returns CPU, memory, uptime, BGP peers,
+        and interface throughput in Mbps. For SNMP-exported devices (where those metrics
+        don't exist), automatically falls back to discovering all available metric series
+        — equivalent to calling get_available_metrics(). Uses PROMETHEUS_DEVICE_LABEL valve
+        to match the device (default: 'device'; set to 'instance' for SNMP exporter).
         """
         metrics = self._fetch_metrics(name)
-        if not metrics:
-            return json.dumps({"error": f"No metrics found for device '{name}'"}, indent=2)
-        return json.dumps({"device": name, "metrics": metrics}, indent=2)
+        if metrics:
+            return json.dumps({"device": name, "metrics": metrics}, indent=2)
+        # No built-in metrics — fall back to full metric discovery (SNMP exporter etc.)
+        return self.get_available_metrics(name)
 
     def get_available_metrics(self, name: str) -> str:
         """
