@@ -90,16 +90,49 @@ class Tools:
             "primary_ip":  (d.get("primary_ip4") or {}).get("address"),
         }
 
+    def _fetch_metrics(self, name):
+        metrics = {}
+        scalar_queries = {
+            "cpu_percent":    f'device_cpu_percent{{device="{name}"}}',
+            "memory_percent": f'device_memory_percent{{device="{name}"}}',
+            "up":             f'device_up{{device="{name}"}}',
+            "uptime_seconds": f'device_uptime_seconds{{device="{name}"}}',
+            "bgp_peers":      f'device_bgp_peers{{device="{name}"}}',
+        }
+        for key, q in scalar_queries.items():
+            res    = self._prom_query(q)
+            result = res.get("data", {}).get("result", [])
+            if result:
+                metrics[key] = float(result[0]["value"][1])
+                if key == "up":
+                    lbl = result[0].get("metric", {})
+                    metrics["tenant"]   = lbl.get("tenant", "")
+                    metrics["location"] = lbl.get("location", "")
+                    metrics["role"]     = lbl.get("role", "")
+        for direction in ("rx", "tx"):
+            res    = self._prom_query(f'device_interface_{direction}_bps{{device="{name}"}}')
+            ifaces = {}
+            for r in res.get("data", {}).get("result", []):
+                ifaces[r["metric"].get("interface", "?")] = round(float(r["value"][1]) / 1e6, 2)
+            if ifaces:
+                metrics[f"interfaces_{direction}_mbps"] = ifaces
+        return metrics
+
     # ── Tool methods ──────────────────────────────────────────────────────────
 
-    def list_tenants(self) -> str:
+    def list_tenants(self, limit: int = 50, offset: int = 0) -> str:
         """
         List all tenants (customers / organisations) in Nautobot.
+        Paginated — use limit and offset to page through results.
         """
-        data = self._nb_get("tenancy/tenants/")
+        data     = self._nb_get("tenancy/tenants/", {"limit": limit, "offset": offset})
+        returned = len(data["results"])
         return json.dumps({
-            "count":   data["count"],
-            "tenants": [{"name": t["name"]} for t in data["results"]],
+            "count":    data["count"],
+            "returned": returned,
+            "offset":   offset,
+            "has_more": (offset + returned) < data["count"],
+            "tenants":  [{"name": t["name"]} for t in data["results"]],
         }, indent=2)
 
     def list_locations(self, type: str = "", tenant: str = "") -> str:
@@ -141,22 +174,22 @@ class Tools:
             } for loc in data["results"]],
         }, indent=2)
 
-    def list_devices(self, location: str = "", tenant: str = "", role: str = "") -> str:
+    def list_devices(self, location: str = "", tenant: str = "", role: str = "",
+                     limit: int = 50, offset: int = 0) -> str:
         """
         List network devices. At least one filter is required — location, tenant, or role.
-        IMPORTANT: always call list_tenants() first to get the exact tenant name, then
-        list_locations() to get the exact location, then call this with both filters set.
-        Location accepts partial names (e.g. "Wellington Central").
-        Tenant must be exact (e.g. "ANZ Bank New Zealand").
-        Results are paginated — check has_more and use offset to fetch the next page.
+        Always call list_tenants() first to get the exact tenant name, then
+        list_locations(tenant=...) to get the exact location, then call this.
+        Location accepts partial names. Tenant must be exact.
+        Paginated — check has_more and increment offset by limit to fetch the next page.
         """
         if not any([location, tenant, role]):
             return json.dumps({
                 "error": "At least one filter is required (location, tenant, or role). "
-                         "Call list_tenants() first, then list_locations(), then call this."
+                         "Call list_tenants() first, then list_locations(tenant=...), then call this."
             }, indent=2)
 
-        params = {"limit": 50, "offset": 0, "depth": 1}
+        params = {"limit": limit, "offset": offset, "depth": 1}
         if tenant:
             params["tenant"] = tenant
         if role:
@@ -174,8 +207,8 @@ class Tools:
         return json.dumps({
             "count":    data["count"],
             "returned": returned,
-            "offset":   0,
-            "has_more": returned < data["count"],
+            "offset":   offset,
+            "has_more": (offset + returned) < data["count"],
             "devices":  [self._fmt_device(d) for d in data["results"]],
         }, indent=2)
 
@@ -187,6 +220,29 @@ class Tools:
         if not data["results"]:
             return json.dumps({"error": f"Device '{name}' not found"}, indent=2)
         return json.dumps(self._fmt_device(data["results"][0]), indent=2)
+
+    def get_device_interfaces(self, name: str) -> str:
+        """
+        List all interfaces on a device by its exact hostname.
+        Returns interface name, type, status, enabled state, and assigned IP addresses.
+        """
+        dev = self._nb_get("dcim/devices/", {"name": name})
+        if not dev["results"]:
+            return json.dumps({"error": f"Device '{name}' not found"}, indent=2)
+        device_id = dev["results"][0]["id"]
+        data = self._nb_get("dcim/interfaces/", {"device_id": device_id, "depth": 1, "limit": 100})
+        interfaces = []
+        for iface in data["results"]:
+            assignments = self._nb_get("ipam/ip-address-to-interface/", {"interface": iface["id"], "depth": 1})
+            ips = [(a.get("ip_address") or {}).get("address") for a in assignments.get("results", []) if a.get("ip_address")]
+            interfaces.append({
+                "name":    iface["name"],
+                "type":    (iface.get("type") or {}).get("label"),
+                "status":  (iface.get("status") or {}).get("name"),
+                "enabled": iface.get("enabled", True),
+                "ips":     ips,
+            })
+        return json.dumps({"device": name, "count": len(interfaces), "interfaces": interfaces}, indent=2)
 
     def get_inventory_summary(self) -> str:
         """
@@ -202,39 +258,104 @@ class Tools:
             "total_locations": locations["count"],
         }, indent=2)
 
+    def get_tenant_summary(self, tenant: str) -> str:
+        """
+        Get a breakdown of devices for a specific tenant, grouped by role, device type,
+        and location. Use this to answer questions like "what devices does customer X use?"
+        or "how many routers does customer X have?".
+        """
+        t_data = self._nb_get("tenancy/tenants/", {"name": tenant})
+        if not t_data["results"]:
+            return json.dumps({"error": f"Tenant '{tenant}' not found"}, indent=2)
+        tenant_id = t_data["results"][0]["id"]
+
+        devs = self._nb_get("dcim/devices/", {"tenant_id": tenant_id, "limit": 500, "depth": 1})
+        by_role, by_type, by_location = {}, {}, {}
+        for d in devs.get("results", []):
+            role = (d.get("role")        or {}).get("name", "Unknown")
+            dt   = (d.get("device_type") or {}).get("display", "Unknown")
+            loc  = (d.get("location")    or {}).get("name",    "Unknown")
+            by_role[role]         = by_role.get(role, 0) + 1
+            by_type[dt]           = by_type.get(dt, 0) + 1
+            by_location[loc]      = by_location.get(loc, 0) + 1
+
+        return json.dumps({
+            "tenant":       tenant,
+            "total_devices": devs["count"],
+            "by_role":      by_role,
+            "by_device_type": by_type,
+            "by_location":  by_location,
+        }, indent=2)
+
+    def list_prefixes(self, tenant: str = "", limit: int = 50, offset: int = 0) -> str:
+        """
+        List IPAM prefixes. Optionally filter by tenant name.
+        Paginated — use limit and offset to page through results.
+        """
+        params = {"limit": limit, "offset": offset}
+        if tenant:
+            t_data = self._nb_get("tenancy/tenants/", {"name": tenant})
+            if not t_data["results"]:
+                return json.dumps({"error": f"Tenant '{tenant}' not found"}, indent=2)
+            params["tenant_id"] = t_data["results"][0]["id"]
+        data     = self._nb_get("ipam/prefixes/", params)
+        returned = len(data["results"])
+        return json.dumps({
+            "count":    data["count"],
+            "returned": returned,
+            "offset":   offset,
+            "has_more": (offset + returned) < data["count"],
+            "prefixes": [{
+                "prefix":      p["prefix"],
+                "status":      (p.get("status")    or {}).get("value", ""),
+                "namespace":   (p.get("namespace") or {}).get("name", "Global"),
+                "tenant":      (p.get("tenant")    or {}).get("name"),
+                "description": p.get("description", ""),
+            } for p in data["results"]],
+        }, indent=2)
+
     def get_device_metrics(self, name: str) -> str:
         """
         Get live Prometheus metrics for a specific device by its exact hostname.
         Returns CPU percent, memory percent, up/down status, uptime, BGP peer count
         (routers only), and per-interface receive/transmit throughput in Mbps.
         """
-        metrics = {}
-        scalar_queries = {
-            "cpu_percent":    f'device_cpu_percent{{device="{name}"}}',
-            "memory_percent": f'device_memory_percent{{device="{name}"}}',
-            "up":             f'device_up{{device="{name}"}}',
-            "uptime_seconds": f'device_uptime_seconds{{device="{name}"}}',
-            "bgp_peers":      f'device_bgp_peers{{device="{name}"}}',
-        }
-        for key, q in scalar_queries.items():
-            res    = self._prom_query(q)
-            result = res.get("data", {}).get("result", [])
-            if result:
-                metrics[key] = float(result[0]["value"][1])
-                if key == "up":
-                    lbl = result[0].get("metric", {})
-                    metrics["tenant"]   = lbl.get("tenant", "")
-                    metrics["location"] = lbl.get("location", "")
-                    metrics["role"]     = lbl.get("role", "")
+        metrics = self._fetch_metrics(name)
+        if not metrics:
+            return json.dumps({"error": f"No metrics found for device '{name}'"}, indent=2)
+        return json.dumps({"device": name, "metrics": metrics}, indent=2)
 
-        for direction in ("rx", "tx"):
-            res    = self._prom_query(f'device_interface_{direction}_bps{{device="{name}"}}')
-            ifaces = {}
-            for r in res.get("data", {}).get("result", []):
-                ifaces[r["metric"].get("interface", "?")] = round(float(r["value"][1]) / 1e6, 2)
-            if ifaces:
-                metrics[f"interfaces_{direction}_mbps"] = ifaces
+    def get_metrics_by_location(self, location: str, role: str = "", tenant: str = "") -> str:
+        """
+        Get live Prometheus metrics for a device at a specific location, identified by
+        location name and role (e.g. "Core Router"). Use this when you know the location
+        but not the exact hostname — e.g. "metrics for the router at Wellington Central".
+        If multiple devices match, returns the list so you can pick one.
+        """
+        params = {"depth": 1, "limit": 10}
+        if role:
+            params["role"] = role
+        if tenant:
+            params["tenant"] = tenant
 
+        loc_data = self._nb_get("dcim/locations/", {"q": location, "limit": 10})
+        loc_ids  = [loc["id"] for loc in loc_data.get("results", [])]
+        if not loc_ids:
+            return json.dumps({"error": f"No locations matched '{location}'"}, indent=2)
+        params["location"] = loc_ids
+
+        devs = self._nb_get("dcim/devices/", params)
+        if not devs["results"]:
+            return json.dumps({"error": f"No devices found at '{location}'" + (f" with role '{role}'" if role else "")}, indent=2)
+
+        if len(devs["results"]) > 1:
+            return json.dumps({
+                "note": "Multiple devices matched — use get_device_metrics(name) with one of these:",
+                "devices": [self._fmt_device(d) for d in devs["results"]],
+            }, indent=2)
+
+        name    = devs["results"][0]["name"]
+        metrics = self._fetch_metrics(name)
         if not metrics:
             return json.dumps({"error": f"No metrics found for device '{name}'"}, indent=2)
         return json.dumps({"device": name, "metrics": metrics}, indent=2)
@@ -368,20 +489,17 @@ class Tools:
         Call get_device_creation_context() first to discover valid names.
         """
         try:
-            # Resolve tenant
             t_data = self._nb_get("tenancy/tenants/", {"name": tenant})
             if not t_data["results"]:
                 return json.dumps({"error": f"Tenant '{tenant}' not found"}, indent=2)
             tenant_id = t_data["results"][0]["id"]
 
-            # Resolve location (fuzzy)
             loc_data = self._nb_get("dcim/locations/", {"q": location, "limit": 5})
             if not loc_data["results"]:
                 return json.dumps({"error": f"Location '{location}' not found"}, indent=2)
             location_id      = loc_data["results"][0]["id"]
             location_display = loc_data["results"][0].get("display", location)
 
-            # Resolve role
             role_data = self._nb_get("extras/roles/", {"name": role, "content_types": "dcim.device"})
             if not role_data["results"]:
                 role_data = self._nb_get("extras/roles/", {"q": role, "content_types": "dcim.device"})
@@ -389,21 +507,18 @@ class Tools:
                 return json.dumps({"error": f"Role '{role}' not found"}, indent=2)
             role_id = role_data["results"][0]["id"]
 
-            # Resolve device type — create if not found
             dt_data = self._nb_get("dcim/device-types/", {"model": device_type})
             if dt_data["results"]:
                 device_type_id = dt_data["results"][0]["id"]
             else:
                 if not manufacturer:
                     return json.dumps({
-                        "error": f"Device type '{device_type}' not found. "
-                                 "Provide 'manufacturer' to create it."
+                        "error": f"Device type '{device_type}' not found. Provide 'manufacturer' to create it."
                     }, indent=2)
                 mfr_data = self._nb_get("dcim/manufacturers/", {"name": manufacturer})
                 mfr_id   = mfr_data["results"][0]["id"] if mfr_data["results"] else self._nb_post("dcim/manufacturers/", {"name": manufacturer})["id"]
                 device_type_id = self._nb_post("dcim/device-types/", {"model": device_type, "manufacturer": mfr_id})["id"]
 
-            # Create device
             device    = self._nb_post("dcim/devices/", {
                 "name":        name,
                 "device_type": device_type_id,
