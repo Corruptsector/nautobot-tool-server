@@ -105,6 +105,7 @@ class Tools:
             "device_type": (d.get("device_type") or {}).get("display"),
             "platform":    (d.get("platform")    or {}).get("name"),
             "primary_ip":  (d.get("primary_ip4") or {}).get("address"),
+            "monitoring":  (d.get("custom_fields") or {}).get("monitoring"),
         }
 
     def _fetch_metrics(self, name):
@@ -551,6 +552,7 @@ class Tools:
                     "manufacturer":  "required only if device_type doesn't exist yet",
                     "status":        "'Active'|'Planned'|'Staged' (default: 'Active')",
                     "management_ip": "CIDR e.g. '10.1.1.1/24' (optional)",
+                    "monitoring":    "monitoring profile — choices: 'if_mib' (default)",
                 },
                 "notes": [
                     "Names are resolved to IDs automatically — no UUIDs needed",
@@ -571,6 +573,7 @@ class Tools:
         status: str = "Active",
         manufacturer: str = "",
         management_ip: str = "",
+        monitoring: str = "if_mib",
     ) -> str:
         """
         Create a new device in Nautobot. Handles the full workflow automatically:
@@ -580,7 +583,8 @@ class Tools:
 
         Required: name, tenant (exact), location (partial match OK), role, device_type.
         Optional: manufacturer (only needed if device_type doesn't exist yet),
-                  status (default: Active), management_ip (CIDR, e.g. "10.1.1.1/24").
+                  status (default: Active), management_ip (CIDR, e.g. "10.1.1.1/24"),
+                  monitoring (default: 'if_mib' — monitoring profile custom field).
 
         Call get_device_creation_context() first to discover valid names.
         """
@@ -625,6 +629,9 @@ class Tools:
             })
             device_id = device["id"]
 
+            if monitoring:
+                self._nb_patch(f"dcim/devices/{device_id}/", {"custom_fields": {"monitoring": monitoring}})
+
             result = {
                 "device": {
                     "id":          device_id,
@@ -634,6 +641,7 @@ class Tools:
                     "location":    location_display,
                     "role":        role,
                     "device_type": device_type,
+                    "monitoring":  monitoring or None,
                 }
             }
 
