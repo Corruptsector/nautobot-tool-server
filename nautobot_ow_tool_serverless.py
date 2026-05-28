@@ -102,10 +102,30 @@ class Tools:
             "tenants": [{"name": t["name"]} for t in data["results"]],
         }, indent=2)
 
-    def list_locations(self, type: str = "") -> str:
+    def list_locations(self, type: str = "", tenant: str = "") -> str:
         """
-        List all locations in Nautobot. Optionally filter by type name: Region, Country, or Site.
+        List locations in Nautobot.
+        Optional: filter by type name (Region, Country, or Site).
+        Optional: filter by tenant name — returns only locations that tenant has devices in.
         """
+        if tenant:
+            t_data = self._nb_get("tenancy/tenants/", {"name": tenant})
+            if not t_data["results"]:
+                return json.dumps({"error": f"Tenant '{tenant}' not found"}, indent=2)
+            tenant_id = t_data["results"][0]["id"]
+            devs = self._nb_get("dcim/devices/", {"tenant_id": tenant_id, "limit": 200, "depth": 1})
+            seen = {}
+            for d in devs.get("results", []):
+                loc = d.get("location") or {}
+                if loc.get("id") and loc["id"] not in seen:
+                    seen[loc["id"]] = {
+                        "name":   loc.get("name") or loc.get("display", ""),
+                        "type":   (loc.get("location_type") or {}).get("name"),
+                        "parent": (loc.get("parent") or {}).get("name"),
+                    }
+            locations = list(seen.values())
+            return json.dumps({"count": len(locations), "locations": locations}, indent=2)
+
         params = {"depth": 1}
         if type:
             types = self._nb_get("dcim/location-types/", {"name": type})

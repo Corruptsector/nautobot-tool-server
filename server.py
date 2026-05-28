@@ -187,6 +187,27 @@ class Handler(BaseHTTPRequestHandler):
                 })
 
             elif path == "/locations":
+                if qs.get("tenant"):
+                    # Locations aren't tenant-tagged — derive from the tenant's devices.
+                    t_data = nb_get("tenancy/tenants/", {"name": qs["tenant"]})
+                    if not t_data["results"]:
+                        self.respond({"error": f"Tenant '{qs['tenant']}' not found"}, 404)
+                        return
+                    tenant_id = t_data["results"][0]["id"]
+                    devs = nb_get("dcim/devices/", {"tenant_id": tenant_id, "limit": 200, "depth": 1})
+                    seen = {}
+                    for d in devs.get("results", []):
+                        loc = d.get("location") or {}
+                        if loc.get("id") and loc["id"] not in seen:
+                            seen[loc["id"]] = {
+                                "name":   loc.get("name") or loc.get("display", ""),
+                                "type":   (loc.get("location_type") or {}).get("name"),
+                                "parent": (loc.get("parent") or {}).get("name"),
+                            }
+                    locations = list(seen.values())
+                    self.respond({"count": len(locations), "locations": locations})
+                    return
+
                 params = {"depth": 1}
                 if qs.get("type"):
                     # Nautobot location_type filter requires an ID, not a name.

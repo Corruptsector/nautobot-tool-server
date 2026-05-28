@@ -65,11 +65,13 @@ class Tools:
         result = _get("/tenants")
         return json.dumps(result, indent=2)
 
-    def list_locations(self, type: str = "") -> str:
+    def list_locations(self, type: str = "", tenant: str = "") -> str:
         """
-        List all locations in Nautobot. Optionally filter by type name: Region, Country, or Site.
+        List locations in Nautobot.
+        Optional: filter by type name (Region, Country, or Site).
+        Optional: filter by tenant name — returns only locations that tenant has devices in.
         """
-        result = _get("/locations", {"type": type})
+        result = _get("/locations", {"type": type, "tenant": tenant})
         return json.dumps(result, indent=2)
 
     def get_inventory_summary(self) -> str:
